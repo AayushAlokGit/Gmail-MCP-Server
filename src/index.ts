@@ -18,6 +18,7 @@ import os from 'os';
 import {createEmailMessage, createEmailWithNodemailer} from "./utl.js";
 import { createLabel, updateLabel, deleteLabel, listLabels, findLabelByName, getOrCreateLabel, GmailLabel } from "./label-manager.js";
 import { createFilter, listFilters, getFilter, deleteFilter, filterTemplates, GmailFilterCriteria, GmailFilterAction } from "./filter-manager.js";
+import { GmailMessagePart, EmailAttachment, EmailContent, GmailMessageRequest } from "./types.js";
 import {
     SendEmailSchema,
     ReadEmailSchema,
@@ -45,35 +46,6 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_DIR = path.join(os.homedir(), '.gmail-mcp');
 const OAUTH_PATH = process.env.GMAIL_OAUTH_PATH || path.join(CONFIG_DIR, 'gcp-oauth.keys.json');
 const CREDENTIALS_PATH = process.env.GMAIL_CREDENTIALS_PATH || path.join(CONFIG_DIR, 'credentials.json');
-
-// Type definitions for Gmail API responses
-interface GmailMessagePart {
-    partId?: string;
-    mimeType?: string;
-    filename?: string;
-    headers?: Array<{
-        name: string;
-        value: string;
-    }>;
-    body?: {
-        attachmentId?: string;
-        size?: number;
-        data?: string;
-    };
-    parts?: GmailMessagePart[];
-}
-
-interface EmailAttachment {
-    id: string;
-    filename: string;
-    mimeType: string;
-    size: number;
-}
-
-interface EmailContent {
-    text: string;
-    html: string;
-}
 
 // OAuth2 configuration
 let oauth2Client: OAuth2Client;
@@ -114,8 +86,12 @@ function extractEmailContent(messagePart: GmailMessagePart): EmailContent {
 
 async function loadCredentials() {
     try {
+        console.log('\n=== Loading Credentials ===');
+        console.log(`[${new Date().toISOString()}] Starting credential loading process...`);
+
         // Create config directory if it doesn't exist
         if (!process.env.GMAIL_OAUTH_PATH && !CREDENTIALS_PATH &&!fs.existsSync(CONFIG_DIR)) {
+            console.log(`[${new Date().toISOString()}] Creating config directory: ${CONFIG_DIR}`);
             fs.mkdirSync(CONFIG_DIR, { recursive: true });
         }
 
@@ -123,28 +99,41 @@ async function loadCredentials() {
         const localOAuthPath = path.join(process.cwd(), 'gcp-oauth.keys.json');
         let oauthPath = OAUTH_PATH;
 
+        console.log(`[${new Date().toISOString()}] Checking for OAuth keys...`);
+        console.log(`  - Local path: ${localOAuthPath}`);
+        console.log(`  - Global path: ${OAUTH_PATH}`);
+        console.log(`  - Environment override: ${process.env.GMAIL_OAUTH_PATH || 'None'}`);
+
         if (fs.existsSync(localOAuthPath)) {
             // If found in current directory, copy to config directory
+            console.log(`[${new Date().toISOString()}] ✓ OAuth keys found in current directory`);
             fs.copyFileSync(localOAuthPath, OAUTH_PATH);
-            console.log('OAuth keys found in current directory, copied to global config.');
+            console.log(`[${new Date().toISOString()}] ✓ Copied to global config: ${OAUTH_PATH}`);
         }
 
         if (!fs.existsSync(OAUTH_PATH)) {
-            console.error('Error: OAuth keys file not found. Please place gcp-oauth.keys.json in current directory or', CONFIG_DIR);
+            console.error(`[${new Date().toISOString()}] ✗ Error: OAuth keys file not found. Please place gcp-oauth.keys.json in current directory or ${CONFIG_DIR}`);
             process.exit(1);
         }
 
+        console.log(`[${new Date().toISOString()}] ✓ Loading OAuth keys from: ${OAUTH_PATH}`);
         const keysContent = JSON.parse(fs.readFileSync(OAUTH_PATH, 'utf8'));
         const keys = keysContent.installed || keysContent.web;
 
         if (!keys) {
-            console.error('Error: Invalid OAuth keys file format. File should contain either "installed" or "web" credentials.');
+            console.error(`[${new Date().toISOString()}] ✗ Error: Invalid OAuth keys file format. File should contain either "installed" or "web" credentials.`);
             process.exit(1);
         }
 
-        const callback = process.argv[2] === 'auth' && process.argv[3] 
-        ? process.argv[3] 
+        const keyType = keysContent.installed ? 'installed' : 'web';
+        console.log(`[${new Date().toISOString()}] ✓ OAuth keys type: ${keyType}`);
+        console.log(`[${new Date().toISOString()}] ✓ Client ID: ${keys.client_id.substring(0, 20)}...`);
+
+        const callback = process.argv[2] === 'auth' && process.argv[3]
+        ? process.argv[3]
         : "http://localhost:3000/oauth2callback";
+
+        console.log(`[${new Date().toISOString()}] ✓ OAuth callback URL: ${callback}`);
 
         oauth2Client = new OAuth2Client(
             keys.client_id,
@@ -152,19 +141,83 @@ async function loadCredentials() {
             callback
         );
 
+        console.log(`[${new Date().toISOString()}] ✓ OAuth2Client initialized`);
+
+        // Set up token refresh listener to log and persist refreshed tokens
+        oauth2Client.on('tokens', (tokens) => {
+            console.log(`\n[${new Date().toISOString()}] 🔄 Token Refresh Event Detected`);
+
+            if (tokens.refresh_token) {
+                console.log(`[${new Date().toISOString()}] ℹ️  Received NEW refresh token (rare - usually only on first auth)`);
+            }
+
+            if (tokens.access_token) {
+                console.log(`[${new Date().toISOString()}] ✓ New access token received`);
+                console.log(`[${new Date().toISOString()}]   - Token preview: ${tokens.access_token.substring(0, 20)}...`);
+                console.log(`[${new Date().toISOString()}]   - Expiry: ${tokens.expiry_date ? new Date(tokens.expiry_date).toISOString() : 'Unknown'}`);
+
+                // Persist the refreshed tokens to disk
+                try {
+                    const currentCreds = fs.existsSync(CREDENTIALS_PATH)
+                        ? JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8'))
+                        : {};
+
+                    const updatedCreds = { ...currentCreds, ...tokens };
+                    fs.writeFileSync(CREDENTIALS_PATH, JSON.stringify(updatedCreds, null, 2));
+
+                    console.log(`[${new Date().toISOString()}] ✓ Refreshed tokens saved to: ${CREDENTIALS_PATH}`);
+                } catch (error) {
+                    console.error(`[${new Date().toISOString()}] ✗ Failed to save refreshed tokens:`, error);
+                }
+            }
+
+            console.log(`[${new Date().toISOString()}] ✓ Token refresh complete\n`);
+        });
+
+        // Check for existing credentials
+        console.log(`[${new Date().toISOString()}] Checking for saved credentials...`);
+        console.log(`  - Credentials path: ${CREDENTIALS_PATH}`);
+        console.log(`  - Environment override: ${process.env.GMAIL_CREDENTIALS_PATH || 'None'}`);
+
         if (fs.existsSync(CREDENTIALS_PATH)) {
+            console.log(`[${new Date().toISOString()}] ✓ Found existing credentials file`);
             const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8'));
+
+            // Log credential details (safely)
+            const hasAccessToken = !!credentials.access_token;
+            const hasRefreshToken = !!credentials.refresh_token;
+            const expiryDate = credentials.expiry_date ? new Date(credentials.expiry_date) : null;
+            const isExpired = expiryDate ? expiryDate < new Date() : true;
+
+            console.log(`[${new Date().toISOString()}] Credential details:`);
+            console.log(`  - Has access token: ${hasAccessToken}`);
+            console.log(`  - Has refresh token: ${hasRefreshToken}`);
+            console.log(`  - Token expiry: ${expiryDate ? expiryDate.toISOString() : 'Unknown'}`);
+            console.log(`  - Token status: ${isExpired ? '⚠️  EXPIRED (will auto-refresh on first API call)' : '✓ VALID'}`);
+            console.log(`  - Scopes: ${credentials.scope || 'Unknown'}`);
+
             oauth2Client.setCredentials(credentials);
+            console.log(`[${new Date().toISOString()}] ✓ Credentials loaded into OAuth2Client`);
+        } else {
+            console.log(`[${new Date().toISOString()}] ℹ️  No existing credentials found - authentication required`);
+            console.log(`  Run 'npm run auth' to authenticate`);
         }
+
+        console.log(`[${new Date().toISOString()}] ✓ Credential loading complete\n`);
     } catch (error) {
-        console.error('Error loading credentials:', error);
+        console.error(`[${new Date().toISOString()}] ✗ Error loading credentials:`, error);
         process.exit(1);
     }
 }
 
 async function authenticate() {
+    console.log('\n=== Starting Authentication Flow ===');
+    console.log(`[${new Date().toISOString()}] Initializing OAuth2 authentication...`);
+
     const server = http.createServer();
+    console.log(`[${new Date().toISOString()}] Starting local HTTP server on port 3000...`);
     server.listen(3000);
+    console.log(`[${new Date().toISOString()}] ✓ HTTP server listening on http://localhost:3000`);
 
     return new Promise<void>((resolve, reject) => {
         const authUrl = oauth2Client.generateAuthUrl({
@@ -175,34 +228,70 @@ async function authenticate() {
             ],
         });
 
-        console.log('Please visit this URL to authenticate:', authUrl);
+        console.log(`[${new Date().toISOString()}] ✓ Generated OAuth authorization URL`);
+        console.log(`[${new Date().toISOString()}] Requested scopes:`);
+        console.log(`  - gmail.modify (read, send, delete emails)`);
+        console.log(`  - gmail.settings.basic (manage labels and filters)`);
+        console.log(`[${new Date().toISOString()}] Access type: offline (will receive refresh token)`);
+        console.log('\n' + '='.repeat(80));
+        console.log('Please visit this URL to authenticate:');
+        console.log(authUrl);
+        console.log('='.repeat(80) + '\n');
+        console.log(`[${new Date().toISOString()}] Opening browser automatically...`);
+
         open(authUrl);
+        console.log(`[${new Date().toISOString()}] ✓ Browser opened`);
+        console.log(`[${new Date().toISOString()}] Waiting for OAuth callback...`);
 
         server.on('request', async (req, res) => {
             if (!req.url?.startsWith('/oauth2callback')) return;
 
+            console.log(`[${new Date().toISOString()}] ✓ Received OAuth callback request`);
             const url = new URL(req.url, 'http://localhost:3000');
             const code = url.searchParams.get('code');
 
             if (!code) {
+                console.error(`[${new Date().toISOString()}] ✗ Error: No authorization code in callback`);
                 res.writeHead(400);
                 res.end('No code provided');
                 reject(new Error('No code provided'));
                 return;
             }
 
-            try {
-                const { tokens } = await oauth2Client.getToken(code);
-                oauth2Client.setCredentials(tokens);
-                fs.writeFileSync(CREDENTIALS_PATH, JSON.stringify(tokens));
+            console.log(`[${new Date().toISOString()}] ✓ Authorization code received: ${code.substring(0, 20)}...`);
 
-                res.writeHead(200);
-                res.end('Authentication successful! You can close this window.');
+            try {
+                console.log(`[${new Date().toISOString()}] Exchanging authorization code for tokens...`);
+                const { tokens } = await oauth2Client.getToken(code);
+
+                console.log(`[${new Date().toISOString()}] ✓ Tokens received from Google`);
+                console.log(`[${new Date().toISOString()}] Token details:`);
+                console.log(`  - Access token: ${tokens.access_token ? tokens.access_token.substring(0, 20) + '...' : 'None'}`);
+                console.log(`  - Refresh token: ${tokens.refresh_token ? 'Received (will be saved)' : 'Not received'}`);
+                console.log(`  - Token type: ${tokens.token_type || 'Bearer'}`);
+                console.log(`  - Expiry: ${tokens.expiry_date ? new Date(tokens.expiry_date).toISOString() : 'Unknown'}`);
+                console.log(`  - Scopes: ${tokens.scope || 'Unknown'}`);
+
+                oauth2Client.setCredentials(tokens);
+                console.log(`[${new Date().toISOString()}] ✓ Credentials set in OAuth2Client`);
+
+                console.log(`[${new Date().toISOString()}] Saving credentials to: ${CREDENTIALS_PATH}`);
+                fs.writeFileSync(CREDENTIALS_PATH, JSON.stringify(tokens, null, 2));
+                console.log(`[${new Date().toISOString()}] ✓ Credentials saved successfully`);
+
+                res.writeHead(200, { 'Content-Type': 'text/html' });
+                res.end('<html><body><h1>✓ Authentication Successful!</h1><p>You can close this window and return to the terminal.</p></body></html>');
+                console.log(`[${new Date().toISOString()}] ✓ Success response sent to browser`);
+
                 server.close();
+                console.log(`[${new Date().toISOString()}] ✓ HTTP server closed`);
+                console.log(`[${new Date().toISOString()}] ✓ Authentication flow complete!\n`);
+
                 resolve();
             } catch (error) {
-                res.writeHead(500);
-                res.end('Authentication failed');
+                console.error(`[${new Date().toISOString()}] ✗ Token exchange failed:`, error);
+                res.writeHead(500, { 'Content-Type': 'text/html' });
+                res.end('<html><body><h1>✗ Authentication Failed</h1><p>Please check the terminal for error details.</p></body></html>');
                 reject(error);
             }
         });
@@ -211,16 +300,37 @@ async function authenticate() {
 
 // Main function
 async function main() {
+    console.log('\n╔════════════════════════════════════════════════════════════════╗');
+    console.log('║          Gmail MCP Server - Starting Up                       ║');
+    console.log('╚════════════════════════════════════════════════════════════════╝\n');
+    console.log(`[${new Date().toISOString()}] Server start time: ${new Date().toLocaleString()}`);
+    console.log(`[${new Date().toISOString()}] Node version: ${process.version}`);
+    console.log(`[${new Date().toISOString()}] Platform: ${process.platform}`);
+    console.log(`[${new Date().toISOString()}] Working directory: ${process.cwd()}`);
+
     await loadCredentials();
 
     if (process.argv[2] === 'auth') {
+        console.log(`[${new Date().toISOString()}] Mode: AUTHENTICATION`);
+        console.log(`[${new Date().toISOString()}] Starting interactive authentication flow...\n`);
+
         await authenticate();
-        console.log('Authentication completed successfully');
+
+        console.log('\n╔════════════════════════════════════════════════════════════════╗');
+        console.log('║          Authentication Completed Successfully!               ║');
+        console.log('╚════════════════════════════════════════════════════════════════╝\n');
+        console.log(`[${new Date().toISOString()}] You can now start the server with: npm start`);
         process.exit(0);
     }
 
+    console.log(`[${new Date().toISOString()}] Mode: SERVER`);
+    console.log(`[${new Date().toISOString()}] Initializing Gmail API client...\n`);
+
     // Initialize Gmail API
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+
+    console.log(`[${new Date().toISOString()}] ✓ Gmail API client initialized`);
+    console.log(`[${new Date().toISOString()}] ✓ Using Gmail API v1`);
 
     // Server implementation
     const server = new Server({
@@ -401,12 +511,6 @@ async function main() {
                         .replace(/\+/g, '-')
                         .replace(/\//g, '_')
                         .replace(/=+$/, '');
-
-                    // Define the type for messageRequest
-                    interface GmailMessageRequest {
-                        raw: string;
-                        threadId?: string;
-                    }
 
                     const messageRequest: GmailMessageRequest = {
                         raw: encodedMessage,
@@ -1090,11 +1194,24 @@ async function main() {
         }
     });
 
+    console.log(`[${new Date().toISOString()}] Setting up MCP server transport...`);
     const transport = new StdioServerTransport();
+    console.log(`[${new Date().toISOString()}] ✓ StdioServerTransport initialized`);
+
+    console.log(`[${new Date().toISOString()}] Connecting server to transport...`);
     server.connect(transport);
+
+    console.log('\n╔════════════════════════════════════════════════════════════════╗');
+    console.log('║          Gmail MCP Server Ready!                              ║');
+    console.log('╚════════════════════════════════════════════════════════════════╝\n');
+    console.log(`[${new Date().toISOString()}] ✓ Server is now listening for MCP requests`);
+    console.log(`[${new Date().toISOString()}] ✓ All tools registered and ready to use`);
+    console.log(`[${new Date().toISOString()}] ℹ️  Token refresh will happen automatically when needed\n`);
 }
 
 main().catch((error) => {
-    console.error('Server error:', error);
+    console.error(`\n[${new Date().toISOString()}] ✗ FATAL ERROR: Server startup failed`);
+    console.error(`[${new Date().toISOString()}] Error details:`, error);
+    console.error(`[${new Date().toISOString()}] Stack trace:`, error.stack);
     process.exit(1);
 });
